@@ -101,8 +101,8 @@ int main(int argc, char **argv) {
     hdr->terminate_flag = 0;
 
     /* inicializar semáforos globales (pshared = 1) */
-    if (sem_init(&hdr->meta_mutex, 1, 1) == -1) {
-        perror("sem_init meta_mutex");
+    if (sem_init(&hdr->control_sem, 1, 1) == -1) {
+        perror("sem_init control_sem");
         goto cleanup_error;
     }
     if (sem_init(&hdr->empty_count, 1, buf_size) == -1) {

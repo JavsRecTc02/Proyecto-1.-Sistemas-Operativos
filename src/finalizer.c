@@ -59,15 +59,15 @@ int main(int argc, char **argv) {
 
     shared_header_t *hdr = (shared_header_t*) map;
 
-    /* Indicar terminación de forma atómica */
-    if (sem_wait(&hdr->meta_mutex) == -1) {
-        perror("sem_wait meta_mutex");
+    /* Indicar terminación de forma atómica mediante el semaforo de control */
+    if (sem_wait(&hdr->control_sem) == -1) {
+        perror("sem_wait control_sem");
         munmap(map, file_size);
         close(fd);
         return 1;
     }
     hdr->terminate_flag = 1;
-    sem_post(&hdr->meta_mutex);
+    sem_post(&hdr->control_sem);
 
     /* Despertar a quién esté bloqueado en empty_count/full_count */
     /* postear suficiente cantidad para liberar procesos bloqueados */
@@ -78,10 +78,10 @@ int main(int argc, char **argv) {
     }
 
     /* Si no hay procesos activos -> imprimir y salir */
-    sem_wait(&hdr->meta_mutex);
+    sem_wait(&hdr->control_sem);
     int active_emitters = hdr->active_emitters;
     int active_receivers = hdr->active_receivers;
-    sem_post(&hdr->meta_mutex);
+    sem_post(&hdr->control_sem);
 
     if (active_emitters == 0 && active_receivers == 0) {
         print_stats_and_scan(hdr);
@@ -105,16 +105,16 @@ int main(int argc, char **argv) {
 
         int rc = sem_timedwait(&hdr->finalizer_sem, &ts);
         if (rc == 0) {
-            /* finalizer_sem -> último proceso terminó */
+            /* finalizer_sem -> si es 1 el último proceso terminó */
             final_ok = 1;
             break;
         } else {
             if (errno == ETIMEDOUT) {
                 /* timeout: re-check active counts */
-                sem_wait(&hdr->meta_mutex);
+                sem_wait(&hdr->control_sem);
                 active_emitters = hdr->active_emitters;
                 active_receivers = hdr->active_receivers;
-                sem_post(&hdr->meta_mutex);
+                sem_post(&hdr->control_sem);
 
                 if (active_emitters == 0 && active_receivers == 0) {
                     final_ok = 1;
@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
     }
 
     if (!final_ok) {
-        fprintf(stderr, "\n[finalizer] Aviso: tiempo de espera excedido (%d s). Procederé a imprimir estadísticas parciales.\n", MAX_WAIT_SECONDS);
+        fprintf(stderr, "\n[finalizer] Aviso: tiempo de espera excedido (%d s). Procesos terminados.\n", MAX_WAIT_SECONDS);
     }
 
     /* imprimir estadísticas y conteo de ranuras ocupadas */
@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
     /* limpieza */
     munmap(map, file_size);
     close(fd);
-    if (shm_unlink(shm_name) == 0) printf("[finalizer] Shared memory unlinked.\n");
+    if (shm_unlink(shm_name) == 0) printf("[finalizer] Memoria compartida unlinked del sistema.\n");
 
     return 0;
 }

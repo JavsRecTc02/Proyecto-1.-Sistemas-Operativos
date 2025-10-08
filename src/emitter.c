@@ -40,6 +40,7 @@ void set_raw_mode(int enable) {
     }
 }
 
+ /* Estructura de los datos enviados hacia el receptor */
 int send_byte(shared_header_t *hdr, sem_t *slot_sems, buffer_slot_t *slots, uint8_t byte, uint8_t key) {
     if (sem_wait(&hdr->empty_count) == -1) {
         if (errno == EINTR) return -1;
@@ -47,30 +48,41 @@ int send_byte(shared_header_t *hdr, sem_t *slot_sems, buffer_slot_t *slots, uint
         return -1;
     }
 
-    if (sem_wait(&hdr->meta_mutex) == -1) { perror("sem_wait meta"); return -1; }
+    if (sem_wait(&hdr->control_sem) == -1) { perror("sem_wait meta"); return -1; }
     int idx = hdr->head;
     hdr->head = (hdr->head + 1) % hdr->buffer_size;
     uint64_t seq = ++hdr->seq_counter;
-    sem_post(&hdr->meta_mutex);
+    sem_post(&hdr->control_sem);
 
     if (sem_wait(&slot_sems[idx]) == -1) { perror("sem_wait slot"); return -1; }
 
+    /* Encriptacion de los caracteres ingresados con Byte XOR key */
     slots[idx].ascii = (uint8_t)(byte ^ key);
     slots[idx].seq = seq;
     clock_gettime(CLOCK_REALTIME, &slots[idx].ts);
     slots[idx].occupied = 1;
 
+    /* Informacion del caracter ingresado */
     struct timespec ts = slots[idx].ts;
-    printf("\x1b[1;32m[EMIT]\x1b[0m idx=%d seq=%lu encoded=%u (orig=%c) time=%ld.%09ld\n",
-           idx, (unsigned long)seq, (unsigned int)slots[idx].ascii,
-           (byte >= 32 && byte <= 126) ? (char)byte : '?',
-           (long)ts.tv_sec, ts.tv_nsec);
+    time_t ssec = ts.tv_sec;
+    struct tm tmv;
+    localtime_r(&ssec, &tmv);
 
+    char tbuf[64];
+    strftime(tbuf, sizeof(tbuf), "%F %T", &tmv);
+
+    printf("\x1b[1;32m[EMIT]\x1b[0m idx=%2d seq=%5lu encoded=%3u (orig='%c') time=%s.%03ld\n",
+        idx, (unsigned long)seq,
+        (unsigned int)slots[idx].ascii,
+        (byte >= 32 && byte <= 126) ? (char)byte : '?',
+        tbuf, ts.tv_nsec);
+        
     sem_post(&slot_sems[idx]);
     sem_post(&hdr->full_count);
     return 0;
 }
 
+ /* Ejecucion / Flujo del programa */
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <shm_name> <mode:manual|auto> <key>\n", argv[0]);
@@ -98,7 +110,7 @@ int main(int argc, char **argv) {
     /* archivo que mantiene el texto (coherencia con inicializer) */
     FILE *f = fopen(hdr->filename, "a+");
     if (!f) {
-        fprintf(stderr, "Error abriendo %s: %s\n", hdr->filename, strerror(errno));
+        fprintf(stderr, "Error abriendo el archivo %s: %s\n", hdr->filename, strerror(errno));
         munmap(map, file_size); close(fd);
         return 1;
     }
@@ -112,15 +124,16 @@ int main(int argc, char **argv) {
     sigaction(SIGALRM, &sa_alrm, NULL);
 
     /* registrar : total_emitters_spawned++ y active_emitters++ */
-    sem_wait(&hdr->meta_mutex);
+    sem_wait(&hdr->control_sem);
     hdr->total_emitters_spawned++;
     hdr->active_emitters++;
-    sem_post(&hdr->meta_mutex);
+    sem_post(&hdr->control_sem);
 
     if (key_arg == 0) local_key = hdr->key;
 
     printf("[EMITTER] shm=%s mode=%s key=%u file=%s\n", shm_name, mode, (unsigned int)local_key, hdr->filename);
 
+    /* Emisor en modo automatico */
     if (strcmp(mode, "auto") == 0) {
         printf("[AUTO] Escriba caracteres; se enviarán automáticamente cada 1 s.\n");
         set_raw_mode(1);
@@ -161,8 +174,9 @@ int main(int argc, char **argv) {
         }
         set_raw_mode(0);
     }
-    else { /* manual */
-        printf("[MANUAL] Escriba texto y presione ENTER. (Ctrl+C para salir)\n");
+    else { 
+         /* Emisor en modo manual */
+        printf("[MANUAL] Escriba texto y presione ENTER para enviar\n");
         /* Usar select con bloqueos para permitir terminar por terminate_flag */
         char line[1024];
         while (keep_running && !hdr->terminate_flag) {
@@ -193,14 +207,14 @@ int main(int argc, char **argv) {
     }
 
     /* Parac cerrar decrementar active_emitters / ultimo hace finalizer_sem */
-    sem_wait(&hdr->meta_mutex);
+    sem_wait(&hdr->control_sem);
     if (hdr->active_emitters > 0) hdr->active_emitters--;
     int ae = hdr->active_emitters;
     int ar = hdr->active_receivers;
     if (ae == 0 && ar == 0) {
         sem_post(&hdr->finalizer_sem);
     }
-    sem_post(&hdr->meta_mutex);
+    sem_post(&hdr->control_sem);
 
     fclose(f);
     munmap(map, file_size);

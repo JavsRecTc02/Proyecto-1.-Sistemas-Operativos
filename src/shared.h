@@ -31,7 +31,7 @@ typedef struct {
     int active_receivers;
     uint8_t key;                     /* llave (8 bits) almacenada por initializer */
     char filename[MAX_FILENAME];     /* archivo de entrada (ruta) */
-    sem_t meta_mutex;                /* protege counters y head/tail/seq */
+    sem_t control_sem;                /* protege counters y head/tail/seq */
     sem_t empty_count;               /* contador de espacios libres (inicial = N) */
     sem_t full_count;                /* contador de espacios ocupados (inicial = 0) */
     sem_t finalizer_sem;             /* para que finalizer espere a que todos terminen */

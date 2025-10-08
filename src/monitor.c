@@ -31,10 +31,10 @@ int main(int argc, char **argv) {
 
     while (!hdr->terminate_flag) {
         // Espera actividad (ya sea un full o empty que indique movimiento)
-        sem_wait(&hdr->meta_mutex);
+        sem_wait(&hdr->control_sem);
         int active_emitters = hdr->active_emitters;
         int active_receivers = hdr->active_receivers;
-        sem_post(&hdr->meta_mutex);
+        sem_post(&hdr->control_sem);
 
         // Mostrar estado general
         printf("\033[2J\033[H"); // limpiar pantalla (ANSI escape)
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
         }
 
         fflush(stdout);
-        sleep(1);  // refresca cada 1 segundo (sin busy waiting)
+        sleep(1);  // Refrescar monitorio cada segundo
     }
 
     munmap(map, file_size);
