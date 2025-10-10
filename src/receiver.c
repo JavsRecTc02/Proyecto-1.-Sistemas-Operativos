@@ -7,19 +7,89 @@
 #include <string.h>
 #include <signal.h>
 #include <errno.h>
-#include <sys/select.h>
+#include <time.h>
+#include <semaphore.h>
 #include "shared.h"
 
 static volatile sig_atomic_t keep_running = 1;
 void sigint_handler(int s) { (void)s; keep_running = 0; }
 
-static int safe_sem_wait(sem_t *s) {
-    while (1) {
-        if (sem_wait(s) == 0) return 0;
-        if (errno == EINTR) continue;
+/* Procesa una única ranura, ya se consumió un full_count por el caller */
+static int process_one_slot(shared_header_t *hdr, sem_t *slot_sems, buffer_slot_t *slots, FILE *out, int key) {
+    /* indice de lectura de forma atómica */
+    if (sem_wait(&hdr->control_sem) == -1) {
+        /* el bucle principal decidirá si continua o sale */
+        if (errno == EINTR) return -1; 
+        perror("sem_wait control_sem");
         return -1;
     }
+    int idx = hdr->tail;
+    hdr->tail = (hdr->tail + 1) % hdr->buffer_size;
+    sem_post(&hdr->control_sem);
+
+    /* bloquear ranura y leer */
+    if (sem_wait(&slot_sems[idx]) == -1) {
+        if (errno == EINTR) return -1;
+        perror("sem_wait slot_sems");
+        return -1;
+    }
+
+    if (!slots[idx].occupied) {
+        /* condición para liberar y devolver */
+        sem_post(&slot_sems[idx]);
+        sem_post(&hdr->empty_count);
+        return 0;
+    }
+
+    /* Decodificar los caracteres leidos de memoria compartida char XOR key*/
+    uint8_t encoded = slots[idx].ascii;
+    uint8_t decoded = encoded ^ (uint8_t)key;
+    uint64_t seq = slots[idx].seq;
+    struct timespec ts = slots[idx].ts;
+
+    /* escribir en archivo de salida */
+    if (fwrite(&decoded, 1, 1, out) != 1) {
+        perror("fwrite salida");
+        /* Limpiar la ranura */
+    }
+    fflush(out);
+
+    /* actualizar estadísticas para control de mem */
+    if (sem_wait(&hdr->control_sem) == -1) {
+        sem_post(&slot_sems[idx]);
+        sem_post(&hdr->empty_count);
+        if (errno == EINTR) return -1;
+        perror("sem_wait control_sem");
+        return -1;
+    }
+    hdr->total_transferred++;
+    sem_post(&hdr->control_sem);
+
+    /* imprimir info: index, seq, encoded -> decoded y tiempo */
+    time_t ssec = ts.tv_sec;
+    struct tm tmv;
+    localtime_r(&ssec, &tmv);
+    char tbuf[64];
+    strftime(tbuf, sizeof(tbuf), "%F %T", &tmv);
+
+    printf("\x1b[1;34m[RECV]\x1b[0m idx=%2d seq=%5lu enc=%3u (0x%02X) -> dec=%3u (0x%02X) char='%c' time=%s.%03ld\n",
+           idx, (unsigned long)seq,
+           (unsigned int)encoded, (unsigned int)encoded,
+           (unsigned int)decoded, (unsigned int)decoded,
+           (decoded >= 32 && decoded <= 126) ? (char)decoded : '?',
+           tbuf, (long)(ts.tv_nsec / 1000000));
+
+    /* marcar libre la ranura */
+    slots[idx].occupied = 0;
+    slots[idx].ascii = 0;
+    slots[idx].seq = 0;
+
+    sem_post(&slot_sems[idx]);
+    sem_post(&hdr->empty_count);
+    return 0;
 }
+
+/* Flujo del Proceso de Receptor*/
 
 int main(int argc, char **argv) {
     if (argc != 4) {
@@ -45,16 +115,20 @@ int main(int argc, char **argv) {
     sem_t *slot_sems = get_slot_sems(hdr);
     buffer_slot_t *slots = get_slots(hdr);
 
-    /* realizar el archivo de salida */
+    /* archivo de salida */
     FILE *out = fopen("texto_salida.txt", "a");
     if (!out) { perror("fopen salida"); munmap(map, file_size); close(fd); return 1; }
 
     /* señales */
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigint_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     /* registrar nacimiento atomico */
-    if (safe_sem_wait(&hdr->control_sem) == -1) {
+    if (sem_wait(&hdr->control_sem) == -1) {
+        if (errno == EINTR) goto cleanup;
         perror("sem_wait control_sem (start)");
         goto cleanup;
     }
@@ -62,164 +136,76 @@ int main(int argc, char **argv) {
     hdr->active_receivers++;
     sem_post(&hdr->control_sem);
 
-    printf("[RECEPTOR] Conectado a %s modo=%s key=%d\n", shm_name, mode, key);
+    printf("[RECEPTOR] Conectado a %s modo=%s key=%d buffer_size=%d\n",
+           shm_name, mode, key, hdr->buffer_size);
 
     if (strcmp(mode, "auto") == 0) {
-        /* modo automático procesar cada dato en cuanto esté disponible */
+        /* MODO AUTOMÁTICO: bloquea en sem_wait(full_count) cuando no hay datos */
         while (keep_running && !hdr->terminate_flag) {
-            /* bloquear hasta que haya al menos 1 dato */
-            if (safe_sem_wait(&hdr->full_count) == -1) {
+            if (sem_wait(&hdr->full_count) == -1) {
+                /* interrumpido por señal: reintentar o salir */
+                if (errno == EINTR) continue; 
+                perror("sem_wait full_count");
+                break;
+            }
+
+            /* Si finalizer pidió terminar, devolver y salir */
+            if (hdr->terminate_flag) {
+                sem_post(&hdr->full_count);
+                break;
+            }
+
+            if (process_one_slot(hdr, slot_sems, slots, out, key) == -1) {
+                /* si fue EINTR intentamos seguir; si es error entonces sale */
                 if (errno == EINTR) continue;
                 break;
             }
-
-            /* si finalizer pidió terminar, devolvemos y salimos */
-            if (hdr->terminate_flag) {
-                sem_post(&hdr->full_count); /* permitir a otros wakeups si fue posteado en exceso */
-                break;
-            }
-
-            /* obtener índice de lectura de forma atómica */
-            if (safe_sem_wait(&hdr->control_sem) == -1) break;
-            int idx = hdr->tail;
-            hdr->tail = (hdr->tail + 1) % hdr->buffer_size;
-            sem_post(&hdr->control_sem);
-
-            /* bloquear ranura y leer */
-            if (safe_sem_wait(&slot_sems[idx]) == -1) {
-                /* si falla volvemos a postear full_count para no perder el dato */
-                sem_post(&hdr->full_count);
-                continue;
-            }
-
-            if (!slots[idx].occupied) {
-                /* podría suceder si finalizer nos despertó; restaurar y continuar */
-                sem_post(&slot_sems[idx]);
-                sem_post(&hdr->full_count);
-                continue;
-            }
-
-            uint8_t encoded = slots[idx].ascii;
-            uint8_t decoded = encoded ^ (uint8_t)key;
-            uint64_t seq = slots[idx].seq;
-            struct timespec ts = slots[idx].ts;
-
-            /* escribir en salida (archivo y stdout) */
-            fwrite(&decoded, 1, 1, out);
-            fflush(out);
-
-            /* actualizar estadísticas */
-            if (safe_sem_wait(&hdr->control_sem) == -1) { sem_post(&slot_sems[idx]); sem_post(&hdr->empty_count); break; }
-            hdr->total_transferred++;
-            sem_post(&hdr->control_sem);
-
-            /* Informacion del caracter obtenido */
-            time_t ssec = ts.tv_sec;
-            struct tm tmv;
-            localtime_r(&ssec, &tmv);
-            char tbuf[64];
-            strftime(tbuf, sizeof(tbuf), "%F %T", &tmv);
-            printf("\x1b[1;34m[RECV]\x1b[0m (AUTO) idx=%2d seq=%5lu char='%c' time=%s.%03ld\n",
-                   idx, (unsigned long)seq,
-                   (decoded >= 32 && decoded <= 126) ? (char)decoded : '?',
-                   tbuf, ts.tv_nsec);
-
-            /* marcar libre la ranura */
-            slots[idx].occupied = 0;
-            slots[idx].ascii = 0;
-            slots[idx].seq = 0;
-
-            sem_post(&slot_sems[idx]);
-            sem_post(&hdr->empty_count);
         }
     }
-    /*Modo Manual*/
     else if (strcmp(mode, "manual") == 0) {
-        char line[4];
-        printf("[RECEIVER] Modo MANUAL. Presione ENTER para leer 1 carácter.\n");
+        /* MODO MANUAL: bloquear en fgets hasta ENTER; luego pedir 1 dato (sem_wait) y procesarlo.*/
+        char line[512];
+        printf("[RECEPTOR] Modo MANUAL. Presione ENTER para leer 1 carácter.\n");
+
         while (keep_running && !hdr->terminate_flag) {
-            /* esperar ENTER: bloqueante en stdin (sin busy-wait) */
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(STDIN_FILENO, &fds);
-            int sel = select(STDIN_FILENO + 1, &fds, NULL, NULL, NULL); /* bloquea */
-            if (sel <= 0) {
-                if (sel == -1 && errno == EINTR) continue;
-                break;
-            }
-            /* consumir la línea (usuario puede teclear algo antes de ENTER) */
-            if (!fgets(line, sizeof(line), stdin)) {
+            if (fgets(line, sizeof(line), stdin) == NULL) {
                 if (feof(stdin)) break;
-                if (errno == EINTR) continue;
+                if (errno == EINTR) continue; /* interrumpido por señal */
+                if (ferror(stdin)) { perror("fgets"); break; }
             }
 
-            /* ahora pedir 1 dato: sem_wait(&full_count) -> bloquea hasta que haya */
-            if (safe_sem_wait(&hdr->full_count) == -1) {
+            /* pedir 1 dato (se bloquea hasta que haya) */
+            if (sem_wait(&hdr->full_count) == -1) {
+                if (errno == EINTR) continue;
+                perror("sem_wait full_count");
+                break;
+            }
+
+            if (hdr->terminate_flag) {
+                sem_post(&hdr->full_count);
+                break;
+            }
+
+            if (process_one_slot(hdr, slot_sems, slots, out, key) == -1) {
                 if (errno == EINTR) continue;
                 break;
             }
-            if (hdr->terminate_flag) { sem_post(&hdr->full_count); break; }
-
-            /* leer exactamente 1 slot (igual que en auto) */
-            if (safe_sem_wait(&hdr->control_sem) == -1) { sem_post(&hdr->full_count); break; }
-            int idx = hdr->tail;
-            hdr->tail = (hdr->tail + 1) % hdr->buffer_size;
-            sem_post(&hdr->control_sem);
-
-            if (safe_sem_wait(&slot_sems[idx]) == -1) {
-                sem_post(&hdr->full_count);
-                continue;
-            }
-
-            if (!slots[idx].occupied) {
-                sem_post(&slot_sems[idx]);
-                sem_post(&hdr->full_count);
-                continue;
-            }
-
-            uint8_t encoded = slots[idx].ascii;
-            uint8_t decoded = encoded ^ (uint8_t)key;
-            uint64_t seq = slots[idx].seq;
-            struct timespec ts = slots[idx].ts;
-
-            fwrite(&decoded, 1, 1, out);
-            fflush(out);
-
-            if (safe_sem_wait(&hdr->control_sem) == -1) { sem_post(&slot_sems[idx]); sem_post(&hdr->empty_count); break; }
-            hdr->total_transferred++;
-            sem_post(&hdr->control_sem);
-
-            time_t ssec = ts.tv_sec;
-            struct tm tmv;
-            localtime_r(&ssec, &tmv);
-            char tbuf[64];
-            strftime(tbuf, sizeof(tbuf), "%F %T", &tmv);
-            printf("\x1b[1;34m[RECV]\x1b[0m (MANUAL) idx=%2d seq=%5lu char='%c' time=%s.%09ld\n",
-                   idx, (unsigned long)seq,
-                   (decoded >= 32 && decoded <= 126) ? (char)decoded : '?',
-                   tbuf, ts.tv_nsec);
-
-            slots[idx].occupied = 0;
-            slots[idx].ascii = 0;
-            slots[idx].seq = 0;
-
-            sem_post(&slot_sems[idx]);
-            sem_post(&hdr->empty_count);
         }
     }
     else {
         fprintf(stderr, "Modo no reconocido: use 'auto' o 'manual'\n");
     }
 
-    /* Hacer Cleanup, decrementar active_receivers y, si somos el último, avisar finalizer */
-    if (safe_sem_wait(&hdr->control_sem) == -1) { perror("sem_wait control_sem (cleanup)"); goto cleanup; }
-    if (hdr->active_receivers > 0) hdr->active_receivers--;
-    int ae = hdr->active_emitters;
-    int ar = hdr->active_receivers;
-    if (ae == 0 && ar == 0) {
-        sem_post(&hdr->finalizer_sem);
+    /* cleanup: decrementar active_receivers y notificar finalizer si somos últimos */
+    if (sem_wait(&hdr->control_sem) == -1) {
+        if (errno != EINTR) perror("sem_wait control_sem (cleanup)");
+    } else {
+        if (hdr->active_receivers > 0) hdr->active_receivers--;
+        int ae = hdr->active_emitters;
+        int ar = hdr->active_receivers;
+        if (ae == 0 && ar == 0) sem_post(&hdr->finalizer_sem);
+        sem_post(&hdr->control_sem);
     }
-    sem_post(&hdr->control_sem);
 
 cleanup:
     fclose(out);

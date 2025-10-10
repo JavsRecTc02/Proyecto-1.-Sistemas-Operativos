@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
         sem_post(&hdr->control_sem);
 
         // Mostrar estado general
-        printf("\033[2J\033[H"); // limpiar pantalla (ANSI escape)
+        printf("\033[2J\033[H"); 
         printf("==== ESTADO ACTUAL DEL BUFFER ====\n");
         printf("Emisores activos: %d | Receptores activos: %d | Buffer size: %d\n", 
                 active_emitters, active_receivers, hdr->buffer_size);

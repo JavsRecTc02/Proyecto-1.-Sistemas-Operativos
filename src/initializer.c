@@ -16,11 +16,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /*Elementos de Entrada*/
     const char *shm_name = argv[1];
     int buf_size = atoi(argv[2]);
     int key = atoi(argv[3]);
     const char *infile = argv[4];
 
+    /* Verificacion de los elementos de entrada*/
     if (shm_name[0] != '/') {
         fprintf(stderr, "Error: shm_name debe comenzar con '/'. Ej: /my_shm\n");
         return 1;
@@ -44,7 +46,6 @@ int main(int argc, char **argv) {
     /* crear archivo de entrada si no existe */
     struct stat st;
     if (stat(infile, &st) == -1) {
-        /* intentar crear archivo vacío con permisos 0644 */
         FILE *tf = fopen(infile, "w");
         if (!tf) {
             fprintf(stderr, "No se pudo crear input_file '%s': %s\n", infile, strerror(errno));
