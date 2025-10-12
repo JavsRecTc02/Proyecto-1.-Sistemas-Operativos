@@ -23,18 +23,32 @@ void sigalrm_handler(int s) { (void)s; timer_fired = 1; }
 static struct termios saved_tio;
 static int raw_enabled = 0;
 
+/* Funcion para capturar entrada caracter a caracter y configurar la terminal, bloqueante o no bloqueante*/
 void set_raw_mode(int enable) {
     struct termios tio;
+
+    /* ACTIVAR modo RAW */
     if (enable && !raw_enabled) {
+        /* Guardar el estado actual del terminal para poder restaurarlo */
         tcgetattr(STDIN_FILENO, &saved_tio);
+        /* Crear una copia modificable de la configuración */
         tio = saved_tio;
+        /*Desactivar opciones de procesamiento en terminal*/
         tio.c_lflag &= ~(ICANON | ECHO);
-        tio.c_cc[VMIN] = 1;
+
+        /*Configurar los parámetros de lectura, de forma bloqueante */
+        tio.c_cc[VMIN]  = 1;
         tio.c_cc[VTIME] = 0;
+        /* Aplicar los cambios */
         tcsetattr(STDIN_FILENO, TCSANOW, &tio);
+        /* Marcar que el modo RAW está activo */
         raw_enabled = 1;
-    } else if (!enable && raw_enabled) {
+    }
+    /* DESACTIVAR modo RAW → restaurar configuración original */
+    else if (!enable && raw_enabled) {
+        /* Restaurar la configuración guardada del terminal */
         tcsetattr(STDIN_FILENO, TCSANOW, &saved_tio);
+        /* Marcar modo normal */
         raw_enabled = 0;
     }
 }
@@ -73,12 +87,21 @@ int send_byte(shared_header_t *hdr, sem_t *slot_sems, buffer_slot_t *slots, uint
     char tbuf[64];
     strftime(tbuf, sizeof(tbuf), "%F %T", &tmv);
 
-    /* mostrar milisegundos (3 decimales) */
-    printf("\x1b[1;32m[EMIS]\x1b[0m idx=%2d seq=%5lu encoded=%3u (orig='%c') time=%s.%03ld\n",
-        idx, (unsigned long)seq,
+    /* mostrar informacion de los caracteres ingresados al buffer de mem compartida */
+
+    printf(
+        "\x1b[1;32m[EMIS]\x1b[0m │ "
+        "\x1b[36mIDX\x1b[0m: %2d │ "
+        "\x1b[36mSEQ\x1b[0m: %5lu │ "
+        "\x1b[34mENC\x1b[0m: %3u │ "
+        "\x1b[33mORIG\x1b[0m: '%c' │ "
+        "\x1b[90mTIME\x1b[0m: %s.%03ld\n",
+        idx,
+        (unsigned long)seq,
         (unsigned int)encoded,
         (byte >= 32 && byte <= 126) ? (char)byte : '?',
         tbuf, ts.tv_nsec / 1000000);
+
 
     sem_post(&slot_sems[idx]);
     sem_post(&hdr->full_count);
@@ -92,22 +115,51 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* ---------------------------------------------------------------
+    *  PARÁMETROS DE ENTRADA DEL PROGRAMA
+    *  argv[1] → nombre del segmento de memoria compartida
+    *  argv[2] → modo de operación
+    *  argv[3] → key usada para cifrar/descifrar
+    * --------------------------------------------------------------- */
+
     const char *shm_name = argv[1];
     const char *mode = argv[2];
     int key_arg = atoi(argv[3]);
+    /* Guardar key como entero de 8 bits */
     uint8_t local_key = (uint8_t)key_arg;
 
+    /* ---------------------------------------------------------------
+    *  ABRIR LA MEMORIA COMPARTIDA EXISTENTE
+    *  Con permisos de lectura y escritura 
+    * ----------------------------------------------------------------*/
     int fd = shm_open(shm_name, O_RDWR, 0);
     if (fd < 0) { perror("shm_open"); return 1; }
 
+    /* ---------------------------------------------------------------
+    *  OBTENER EL TAMAÑO DEL ARCHIVO DE MEMORIA COMPARTIDA
+    *  Usa lseek() para mover el puntero al final (SEEK_END)
+    *  y así obtener su tamaño total en bytes.
+    * --------------------------------------------------------------- */
     off_t file_size = lseek(fd, 0, SEEK_END);
     if (file_size <= 0) { perror("lseek"); close(fd); return 1; }
 
+    /* ---------------------------------------------------------------
+    *  MAPEAR LA MEMORIA COMPARTIDA EN EL ESPACIO DEL PROCESO
+    *  PROT_READ | PROT_WRITE → permisos de lectura y escritura.
+    *  MAP_SHARED → los cambios se reflejan para todos los PEs
+    * --------------------------------------------------------------- */
     void *map = mmap(NULL, (size_t)file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
 
-    shared_header_t *hdr = (shared_header_t*)map;
+
+    /* Encabezado principal con metadatos del sistema compartido */
+    shared_header_t *hdr = (shared_header_t *)map;
+
+    /* Obtener puntero al arreglo de semáforos por cada slot del buffer */
     sem_t *slot_sems = get_slot_sems(hdr);
+
+    /* Obtener puntero al arreglo de estructuras, donde se almacenan 
+    los datos transferidos */
     buffer_slot_t *slots = get_slots(hdr);
 
     /* archivo que mantiene el texto (coherencia con inicializer) */
@@ -118,20 +170,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* señales: SIN SA_RESTART para que read/fgets sean interrumpibles por alarm/ctrl-c */
     struct sigaction sa_int;
     struct sigaction sa_alrm;
     memset(&sa_int, 0, sizeof(sa_int));
     memset(&sa_alrm, 0, sizeof(sa_alrm));
+
+    /* sin SA_RESTART para que fgets/read puedan ser interrumpidas */
     sa_int.sa_handler = sigint_handler;
-    sa_int.sa_flags = 0; /* sin SA_RESTART */
+    sa_int.sa_flags = 0; 
     sa_alrm.sa_handler = sigalrm_handler;
-    sa_alrm.sa_flags = 0; /* sin SA_RESTART */
+    sa_alrm.sa_flags = 0;
+
     sigaction(SIGINT, &sa_int, NULL);
     sigaction(SIGTERM, &sa_int, NULL);
     sigaction(SIGALRM, &sa_alrm, NULL);
 
-    /* registrar : total_emitters_spawned++ y active_emitters++ */
+    /* Registrar, actualizar la lista de emisores lanzados */
     if (sem_wait(&hdr->control_sem) == -1) { perror("sem_wait control_sem"); }
     hdr->total_emitters_spawned++;
     hdr->active_emitters++;
@@ -144,95 +198,128 @@ int main(int argc, char **argv) {
     /* Emisor en modo automatico */
     if (strcmp(mode, "auto") == 0) {
         printf("[EMISOR] Modo AUTO. Ingrese caracteres; se enviarán automáticamente cada 1 s.\n");
-        /* modo raw para capturar single-char input sin esperar ENTER */
         set_raw_mode(1);
+        /* Variables para la alarma/ timer y buff local para escribir en consola*/
         const unsigned int interval = 1;
+        timer_fired = 0;
         alarm(interval);
+        char line[1024];
+        size_t len = 0;
 
-        long last_pos = 0;
         while (keep_running && !hdr->terminate_flag) {
             char c;
-            ssize_t r = read(STDIN_FILENO, &c, 1);
+            ssize_t r = read(STDIN_FILENO, &c, 1);  /* bloqueante */
+
+            /* r = 1 Carácter leído entonce guardar y acumular*/
             if (r == 1) {
-                /* si el usuario escribió, lo guardamos en el archivo y se hace append */
+                /* guardar en archivo */
                 if (fseek(f, 0, SEEK_END) == 0) {
                     fwrite(&c, 1, 1, f);
                     fflush(f);
                 }
-                continue; /* seguir esperando con read bloqueante */
-            } else if (r == 0) {
-                break;
+                /* acumular caracter desde consola en buffer local */
+                if (len < sizeof(line) - 1) {
+                    line[len++] = c;
+                }
+                continue;
+            }
+            /* r = 0 Fin de entrada de caracteres y salir del bucle */
+            if (r == 0) break;
 
-            } else {
-                /* r == -1 */
+            /* r = -1 Interrupción por señal de alarma / timer */
+            if (r == -1) {
                 if (errno == EINTR) {
-                    /* señal interrumpe read; puede ser SIGALRM o SIGINT */
+                    /* interrupción por señal */
                     if (got_sigint) break;
+                    if (hdr->terminate_flag || !keep_running) break;
+
+                    /* Si fue la alarma → enviar todo lo acumulado */
                     if (timer_fired) {
-                        /* Procesar nuevo contenido del archivo en disco */
                         timer_fired = 0;
-                        if (fseek(f, last_pos, SEEK_SET) == -1) {
-                            /* si no se puede posicionar, intentar continuar */
-                        } else {
-                            int ch;
-                            while ((ch = fgetc(f)) != EOF) {
+                        /* Detener mientras se enviar los char */
+                        alarm(0);  
+
+                        if (len > 0) {
+                            for (size_t i = 0; i < len; ++i) {
                                 if (!keep_running || hdr->terminate_flag) break;
-                                /* Se bloquea si el buffer está lleno con sem_wait */
-                                if (send_byte(hdr, slot_sems, slots, (uint8_t)ch, local_key) == -1) {
+                                if (send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key) == -1) {
                                     if (got_sigint) break;
                                 }
                             }
-                            last_pos = ftell(f);
+                            /* limpiar linea de escritura en consola */
+                            len = 0;
                         }
-                        /* Rearmar la alarma */
+                        /* Reactivar timer */
                         alarm(interval);
-                        continue;
-                    }
-                    /* Continual con otra signal y repetir el loop */
-                    continue;
+                    }continue;
                 } else {
                     perror("read stdin");
                     break;
                 }
             }
         }
+        /* Enviar el resto de char antes de salir */
+        if (len > 0) {
+            for (size_t i = 0; i < len; ++i) {
+                if (!keep_running || hdr->terminate_flag) break;
+                send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key);
+            }
+        }
         set_raw_mode(0);
+        alarm(0);
     }
+
     else {
-         /* Emisor en modo manual */
+        /* Emisor en modo manual */
         printf("[EMISOR] Modo MANUAL. Ingrese caracteres y presione ENTER para enviar\n");
         char line[1024];
+        const unsigned int interval = 1;
+        timer_fired = 0;
+        alarm(interval);
 
         while (keep_running && !hdr->terminate_flag) {
-            /* fgets bloquea en kernel hasta que el usuario presione ENTER. */
+            /* fgets bloquea hasta ENTER, pero podrá ser interrumpido por SIGALRM */
             if (fgets(line, sizeof(line), stdin) == NULL) {
                 if (feof(stdin)) break;
                 if (errno == EINTR) {
-                    /* fue interrumpido por señal, comprobar flags y continuar */
+                    /* solo interrumpimos fgets si termina el proceso */
                     if (got_sigint) break;
+                    if (hdr->terminate_flag || !keep_running) break;
+                    /* Rearmar la alarma si fue timer */
+                    if (timer_fired) {
+                        timer_fired = 0;
+                        alarm(interval);
+                    }
                     continue;
                 }
-                /* otro error */
                 if (ferror(stdin)) { perror("fgets"); break; }
             }
-
             size_t len = strcspn(line, "\n");
-            if (len == 0) continue;
-
-            /* Append al archivo con coherencia con modo auto */
+            if (len == 0) {
+                alarm(interval);
+                continue;
+            }
+            /* Escribir al archivo de salida */
             if (fseek(f, 0, SEEK_END) == 0) {
                 fwrite(line, 1, len, f);
                 fwrite("\n", 1, 1, f);
                 fflush(f);
             }
 
+            /* Enviar los caracteres uno a uno */
+            /* Desactivar alarma de timer para no cortar los char */
+            alarm(0);
             for (size_t i = 0; i < len; ++i) {
                 if (!keep_running || hdr->terminate_flag) break;
                 if (send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key) == -1) {
                     if (got_sigint) break;
                 }
             }
+            /* Reactivar el timer después de enviar los char */
+            timer_fired = 0;
+            alarm(interval);
         }
+        alarm(0);
     }
 
     /* Parac cerrar decrementar active_emitters / ultimo hace finalizer_sem */

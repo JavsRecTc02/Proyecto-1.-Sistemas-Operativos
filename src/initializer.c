@@ -135,13 +135,22 @@ int main(int argc, char **argv) {
         slots[i].ts.tv_nsec = 0;
     }
 
-    /* Informacion del proceso de Inicio */
-    printf("Memoria compartida '%s' creada correctamente.\n", shm_name);
-    printf("  Buffer slots    : %d\n", buf_size);
-    printf("  Key (XOR 8-bit) : %d\n", key);
-    printf("  Input file      : %s\n", hdr->filename);
-    printf("  Tamaño shm (bytes): %zu\n", shm_size);
-    printf("Inicialización completa. El proceso 'initializer' finaliza ahora.\n");
+    /* Información del proceso de inicio */
+    printf("\n\x1b[1;36m╔══════════════════════════════════════════════════════════════╗\x1b[0m\n");
+    printf("\x1b[1;36m║                INFORMACIÓN DE INICIALIZACIÓN                 ║\x1b[0m\n");
+    printf("\x1b[1;36m╚══════════════════════════════════════════════════════════════╝\x1b[0m\n");
+
+    printf("  \x1b[1;33m• Memoria compartida:\x1b[0m   \x1b[1;32m'%s'\x1b[0m\n", shm_name);
+    printf("  \x1b[1;33m• Buffer slots:\x1b[0m         \x1b[36m%d\x1b[0m\n", buf_size);
+    printf("  \x1b[1;33m• Clave XOR (8-bit):\x1b[0m    \x1b[35m%d\x1b[0m\n", key);
+    printf("  \x1b[1;33m• Archivo de entrada:\x1b[0m   \x1b[37m%s\x1b[0m\n", hdr->filename);
+    printf("  \x1b[1;33m• Tamaño SHM (bytes):\x1b[0m  \x1b[36m%zu\x1b[0m\n", shm_size);
+
+    printf("\x1b[1;36m──────────────────────────────────────────────────────────────\x1b[0m\n");
+    printf("  \x1b[90mInicialización completada correctamente.\x1b[0m\n");
+    printf("  \x1b[32mMemoria compartida lista para Emisores y Receptores.\x1b[0m\n");
+    printf("\x1b[1;36m══════════════════════════════════════════════════════════════\x1b[0m\n\n");
+
 
     /* Limpieza */
     munmap(map, shm_size);

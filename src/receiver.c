@@ -12,7 +12,10 @@
 #include "shared.h"
 
 static volatile sig_atomic_t keep_running = 1;
+static volatile sig_atomic_t timer_fired = 0;
+
 void sigint_handler(int s) { (void)s; keep_running = 0; }
+void sigalrm_handler(int s) { (void)s; timer_fired = 1; }
 
 /* Procesa una única ranura, ya se consumió un full_count por el caller */
 static int process_one_slot(shared_header_t *hdr, sem_t *slot_sems, buffer_slot_t *slots, FILE *out, int key) {
@@ -50,7 +53,7 @@ static int process_one_slot(shared_header_t *hdr, sem_t *slot_sems, buffer_slot_
     /* escribir en archivo de salida */
     if (fwrite(&decoded, 1, 1, out) != 1) {
         perror("fwrite salida");
-        /* Limpiar la ranura */
+        /* Limpiar el slot liberado */
     }
     fflush(out);
 
@@ -72,12 +75,23 @@ static int process_one_slot(shared_header_t *hdr, sem_t *slot_sems, buffer_slot_
     char tbuf[64];
     strftime(tbuf, sizeof(tbuf), "%F %T", &tmv);
 
-    printf("\x1b[1;34m[RECV]\x1b[0m idx=%2d seq=%5lu enc=%3u (0x%02X) -> dec=%3u (0x%02X) char='%c' time=%s.%03ld\n",
-           idx, (unsigned long)seq,
-           (unsigned int)encoded, (unsigned int)encoded,
-           (unsigned int)decoded, (unsigned int)decoded,
-           (decoded >= 32 && decoded <= 126) ? (char)decoded : '?',
-           tbuf, (long)(ts.tv_nsec / 1000000));
+    /* Informacion de los caracteres leidos desde el buffer*/
+    printf(
+        "\x1b[1;32m[RECV]\x1b[0m │ "         
+        "\x1b[1;33mIDX\x1b[0m: %2d │ "        
+        "\x1b[1;33mSEQ\x1b[0m: %5lu │ "       
+        "\x1b[1;35mENC\x1b[0m: %3u │ "        
+        "\x1b[1;36mDEC\x1b[0m: %3u │ "        
+        "\x1b[1;37mCHAR\x1b[0m: '%c' │ "      
+        "\x1b[90mTIME\x1b[0m: %s.%03ld\n",    
+        idx,
+        (unsigned long)seq,
+        (unsigned int)encoded,
+        (unsigned int)decoded,
+        (decoded >= 32 && decoded <= 126) ? (char)decoded : '?',
+        tbuf, (long)(ts.tv_nsec / 1000000));
+
+
 
     /* marcar libre la ranura */
     slots[idx].occupied = 0;
@@ -123,13 +137,23 @@ int main(int argc, char **argv) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigint_handler;
+    /* sin SA_RESTART para que fgets/read puedan ser interrumpidas */
+    sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    struct sigaction sa_alrm;
+    memset(&sa_alrm, 0, sizeof(sa_alrm));
+    sa_alrm.sa_handler = sigalrm_handler;
+    /* también sin SA_RESTART */
+    sa_alrm.sa_flags = 0;
+    sigaction(SIGALRM, &sa_alrm, NULL);
+
 
     /* registrar nacimiento atomico */
     if (sem_wait(&hdr->control_sem) == -1) {
         if (errno == EINTR) goto cleanup;
-        perror("sem_wait control_sem (start)");
+        perror("sem_wait control_sem");
         goto cleanup;
     }
     hdr->total_receivers_spawned++;
@@ -162,21 +186,46 @@ int main(int argc, char **argv) {
             }
         }
     }
+    /*Modo MANUAL*/
     else if (strcmp(mode, "manual") == 0) {
-        /* MODO MANUAL: bloquear en fgets hasta ENTER; luego pedir 1 dato (sem_wait) y procesarlo.*/
+        /* Bloquear en fgets hasta ENTER; luego pedir 1 dato con sem_wait y procesarlo.*/
         char line[512];
         printf("[RECEPTOR] Modo MANUAL. Presione ENTER para leer 1 carácter.\n");
+
+        /* Alarma para interrumpir fgets y chequear terminate_flag === */
+        const unsigned int interval = 1;
+        timer_fired = 0;
+        alarm(interval);
 
         while (keep_running && !hdr->terminate_flag) {
             if (fgets(line, sizeof(line), stdin) == NULL) {
                 if (feof(stdin)) break;
-                if (errno == EINTR) continue; /* interrumpido por señal */
+                if (errno == EINTR) {
+                    /* Interrumpido por señal SIGALRM o SIGINT */
+                    if (!keep_running || hdr->terminate_flag) break;
+
+                    /* Rearmar si la interrupción fue del timer */
+                    if (timer_fired) {
+                        timer_fired = 0;
+                        alarm(interval);
+                    }
+                    /* volver a intentar fgets bloqueante */
+                    continue;
+                }
                 if (ferror(stdin)) { perror("fgets"); break; }
             }
 
-            /* pedir 1 dato (se bloquea hasta que haya) */
+            /* Evento de ENTER se sigue con la lógica original */
             if (sem_wait(&hdr->full_count) == -1) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR) {
+                    if (!keep_running || hdr->terminate_flag) break;
+                    /* Rearmar timer si venimos de SIGALRM */
+                    if (timer_fired) {
+                        timer_fired = 0;
+                        alarm(interval);
+                    }
+                    continue;
+                }
                 perror("sem_wait full_count");
                 break;
             }
@@ -187,18 +236,30 @@ int main(int argc, char **argv) {
             }
 
             if (process_one_slot(hdr, slot_sems, slots, out, key) == -1) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR) {
+                    if (!keep_running || hdr->terminate_flag) break;
+                    if (timer_fired) {
+                        timer_fired = 0;
+                        alarm(interval);
+                    }
+                    continue;
+                }
                 break;
             }
+
+            /* rearmar la alarma para mantener el timer */
+            alarm(interval);
         }
+        alarm(0);
     }
+
     else {
         fprintf(stderr, "Modo no reconocido: use 'auto' o 'manual'\n");
     }
 
-    /* cleanup: decrementar active_receivers y notificar finalizer si somos últimos */
+    /* Decrementar receptores activos y notificar finalizer si somos últimos */
     if (sem_wait(&hdr->control_sem) == -1) {
-        if (errno != EINTR) perror("sem_wait control_sem (cleanup)");
+        if (errno != EINTR) perror("sem_wait control_sem");
     } else {
         if (hdr->active_receivers > 0) hdr->active_receivers--;
         int ae = hdr->active_emitters;
