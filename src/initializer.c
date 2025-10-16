@@ -11,18 +11,23 @@
 
 
 int main(int argc, char **argv) {
+    // Esperamos exactamente 4 parámetros de usuario.
+    // 1) nombre del SHM iniciado con /
+    // 2) tamaño del buffer
+    // 3) clave XOR (0-255)
+    // 4) archivo de entrada, se crea vacio si no existe
     if (argc != 5) {
         fprintf(stderr, "Uso: %s <shm_name> <buffer_size> <key (0-255)> <input_file>\n", argv[0]);
         return 1;
     }
 
-    /*Elementos de Entrada*/
+    /* -------------------- Lectura y validación de parámetros -------------------- */
     const char *shm_name = argv[1];
     int buf_size = atoi(argv[2]);
     int key = atoi(argv[3]);
     const char *infile = argv[4];
 
-    /* Verificacion de los elementos de entrada*/
+    // Verificacion de cada uno de los elementos de entrada
     if (shm_name[0] != '/') {
         fprintf(stderr, "Error: shm_name debe comenzar con '/'. Ej: /my_shm\n");
         return 1;
@@ -40,10 +45,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* calcular header + N sem_t + N slots */
+    // Tamaño total del segmento SHM = header + N*sem_t + N*buffer_slot_t
     size_t shm_size = compute_shm_size(buf_size);
 
-    /* crear archivo de entrada si no existe */
+    // Si el archivo de entrada no existe, se crea vacío para mantener coherencia
     struct stat st;
     if (stat(infile, &st) == -1) {
         FILE *tf = fopen(infile, "w");
@@ -55,7 +60,8 @@ int main(int argc, char **argv) {
         printf("[initializer] Archivo de entrada '%s' creado (vacío).\n", infile);
     }
 
-    /* Memoria Compartida */
+    /* ------------------------- Crear memoria compartida ------------------------- */
+    // O_CREAT | O_EXCL, falla si ya existe una con el mismo nombre
     int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, SHM_DEFAULT_MODE);
     if (fd < 0) {
         if (errno == EEXIST) {
@@ -66,6 +72,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Ajustar el tamaño del objeto SHM exactamente a shm_size bytes
     if (ftruncate(fd, (off_t)shm_size) == -1) {
         perror("ftruncate");
         close(fd);
@@ -73,6 +80,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Mapear el segmento en el espacio de direcciones de este proceso
     void *map = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
         perror("mmap");
@@ -81,12 +89,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Asegurar memoria limpia */
+    // Limpiar a cero todo el bloque mapeado (header, semáforos y slots)
+    // Deja un estado conocido y quitar basura inicial.
     memset(map, 0, shm_size);
 
+    // Puntero al header dentro del mapeo
     shared_header_t *hdr = (shared_header_t*) map;
 
-    /* Inicializar head*/
+    /* --------------------- Inicialización de campos del header --------------------- */
     hdr->buffer_size = buf_size;
     hdr->head = 0;
     hdr->tail = 0;
@@ -101,28 +111,38 @@ int main(int argc, char **argv) {
     hdr->filename[MAX_FILENAME-1] = '\0';
     hdr->terminate_flag = 0;
 
-    /* inicializar semáforos globales (pshared = 1) */
+    /* ---------------------------- Semáforos globales ---------------------------- */
+    // pshared=1, cuando es visibles entre procesos vía SHM
+
+    // control_sem para cambios en el header (head/tail/contadores)
     if (sem_init(&hdr->control_sem, 1, 1) == -1) {
         perror("sem_init control_sem");
         goto cleanup_error;
     }
+    // empty_count, saber cuántos huecos libres hay en el buffer; inicia en N
     if (sem_init(&hdr->empty_count, 1, buf_size) == -1) {
         perror("sem_init empty_count");
         goto cleanup_error;
     }
+    // full_count, saber cuántos items listos hay; inicia en 0 (buffer vacío)
     if (sem_init(&hdr->full_count, 1, 0) == -1) {
         perror("sem_init full_count");
         goto cleanup_error;
     }
+    // finalizer_sem, se usa para despertar al finalizador cuando ya no quedan procesos activos
     if (sem_init(&hdr->finalizer_sem, 1, 0) == -1) {
         perror("sem_init finalizer_sem");
         goto cleanup_error;
     }
 
-    /* inicializar semáforos por ranura y ranuras */
+    /* --------------------- Semáforos por ranura y slots iniciales --------------------- */
+    // Obtener las regiones dentro del mapeo, con arreglo de semáforos por-slot y arreglo de slots
     sem_t *slot_sems = get_slot_sems(hdr);
     buffer_slot_t *slots = get_slots(hdr);
 
+    // Por cada slot de la mem circular
+    // - semáforo tipo mutex inicial en 1 (permite acceso exclusivo al slot)
+    // - estado del slot occupied=0 y datos en cero
     for (int i = 0; i < buf_size; ++i) {
         if (sem_init(&slot_sems[i], 1, 1) == -1) {
             perror("sem_init slot_sems[i]");
@@ -135,7 +155,7 @@ int main(int argc, char **argv) {
         slots[i].ts.tv_nsec = 0;
     }
 
-    /* Información del proceso de inicio */
+    // Información del proceso de inicio
     printf("\n\x1b[1;36m╔══════════════════════════════════════════════════════════════╗\x1b[0m\n");
     printf("\x1b[1;36m║                INFORMACIÓN DE INICIALIZACIÓN                 ║\x1b[0m\n");
     printf("\x1b[1;36m╚══════════════════════════════════════════════════════════════╝\x1b[0m\n");
@@ -152,13 +172,15 @@ int main(int argc, char **argv) {
     printf("\x1b[1;36m══════════════════════════════════════════════════════════════\x1b[0m\n\n");
 
 
-    /* Limpieza */
+    /* ------------------------------- Limpieza local ------------------------------- */
+    // El initializer solo crea y deja todo listo, despues se desmapea y cierra su FD.
+    munmap(map, shm_size);
     munmap(map, shm_size);
     close(fd);
     return 0;
 
 cleanup_error:
-    /* Limpiar semaforos y unlink memoria compartida*/
+    // Limpiar semaforos y unlink memoria compartida en caso de error
     munmap(map, shm_size);
     close(fd);
     shm_unlink(shm_name);
