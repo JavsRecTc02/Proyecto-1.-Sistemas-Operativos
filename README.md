@@ -17,9 +17,12 @@ Ruta del archivo de lectura = ./texto_entrada.txt
 
 4. Finalizador: ./finalizer /my_shm -> 
 Termina los procesos y muestra todas las estadisticas de los heavy process
-->**Problema los procesos en modo Manual solo terminan despues de ejecutar el finalizer y dar un Enter
 
 6. Se hizo un monitor, para ver la memoria compartida y el llenado del Buffer, el head y tail.
 -> ./monitor /my_shm
 - Usar modo Manual para observar mejor los cambios en el Buffer se forma circular
+
+7. Ver los heavy process y su uso de CPU
+top -p $(pgrep -d, -f 'emitter|receiver|monitor|finalizer')
+
 
