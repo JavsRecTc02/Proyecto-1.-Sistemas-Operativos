@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include "shared.h"
+#include <inttypes.h>
 
 
 int main(int argc, char **argv) {
@@ -155,7 +156,15 @@ int main(int argc, char **argv) {
         slots[i].ts.tv_nsec = 0;
     }
 
-    // Información del proceso de inicio
+    // Calcula tamaños reales y punteros ya mapeados
+    size_t sz_hdr  = sizeof(shared_header_t);
+    size_t sz_sem  = sizeof(sem_t);
+    size_t sz_slot = sizeof(buffer_slot_t);
+
+    // Validar con compute_shm_size(N), que ftruncate() fue exacto en la mem compartida
+    size_t shm_size_expected = compute_shm_size(buf_size);
+
+    /* ------------------------------- Informacion del Inicializador ------------------------------------- */
     printf("\n\x1b[1;36m╔══════════════════════════════════════════════════════════════╗\x1b[0m\n");
     printf("\x1b[1;36m║                INFORMACIÓN DE INICIALIZACIÓN                 ║\x1b[0m\n");
     printf("\x1b[1;36m╚══════════════════════════════════════════════════════════════╝\x1b[0m\n");
@@ -166,11 +175,36 @@ int main(int argc, char **argv) {
     printf("  \x1b[1;33m• Archivo de entrada:\x1b[0m   \x1b[37m%s\x1b[0m\n", hdr->filename);
     printf("  \x1b[1;33m• Tamaño SHM (bytes):\x1b[0m  \x1b[36m%zu\x1b[0m\n", shm_size);
 
+    // Detalles de layout con tamaños y totales
+    size_t total_simple = sz_hdr + (size_t)buf_size * sz_sem + (size_t)buf_size * sz_slot;
+
+    printf("\x1b[1;36m──────────────── DETALLES DE LAYOUT ────────────────\x1b[0m\n");
+    printf("  \x1b[90mHeader (shared_header_t)\x1b[0m : %zu\n", sz_hdr);
+    printf("  \x1b[90mSemáforos por ranura (sem_t)\x1b[0m  : %zu  (× %d = %zu)\n",
+        sz_sem, buf_size, (size_t)buf_size * sz_sem);
+    printf("  \x1b[90mRanuras de buffer (buffer_slot_t)\x1b[0m : %zu  (× %d = %zu)\n",
+        sz_slot, buf_size, (size_t)buf_size * sz_slot);
+    printf("  \x1b[90mTotal esperado\x1b[0m  : \x1b[36m%zu\x1b[0m\n", total_simple);
+
+    // Tamaño reservado según compute_shm_size(N) en el Header
+    printf("  \x1b[90mTamaño reservado\x1b[0m : \x1b[36m%zu\x1b[0m\n", shm_size_expected);
+
+
+    // Punteros para offset, del header, slot_sem, slots
+    printf("  \x1b[90mPtr header\x1b[0m              : %p\n", (void*)hdr);
+    printf("  \x1b[90mPtr slot_sems\x1b[0m           : %p (N x sem_t)\n", (void*)slot_sems);
+    printf("  \x1b[90mPtr slots\x1b[0m               : %p (N x buffer_slot_t)\n", (void*)slots);
+
+    // Comparar el size obtenido con el esperado
+    if (shm_size != shm_size_expected) {
+        printf("  \x1b[1;31m¡Aviso!\x1b[0m tamaño real del segmento = %zu, pero compute_shm_size(N) = %zu.\n",
+            shm_size, shm_size_expected);
+    }
+    // Proceso de Inicializador termino
     printf("\x1b[1;36m──────────────────────────────────────────────────────────────\x1b[0m\n");
     printf("  \x1b[90mInicialización completada correctamente.\x1b[0m\n");
     printf("  \x1b[32mMemoria compartida lista para Emisores y Receptores.\x1b[0m\n");
     printf("\x1b[1;36m══════════════════════════════════════════════════════════════\x1b[0m\n\n");
-
 
     /* ------------------------------- Limpieza local ------------------------------- */
     // El initializer solo crea y deja todo listo, despues se desmapea y cierra su FD.

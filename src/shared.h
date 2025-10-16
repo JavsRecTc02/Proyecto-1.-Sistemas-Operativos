@@ -46,7 +46,7 @@ static inline buffer_slot_t* get_slots(shared_header_t *hdr) {
     return (buffer_slot_t *) ((char*)hdr + sizeof(shared_header_t) + hdr->buffer_size * sizeof(sem_t));
 }
 
-/* Tamaño total a reservar para shm: header + N*sem + N*slot */
+/* Tamaño total a reservar para la memoria compartida: header + N*sem + N*slot */
 static inline size_t compute_shm_size(int n) {
     return sizeof(shared_header_t) + (size_t)n * sizeof(sem_t) + (size_t)n * sizeof(buffer_slot_t);
 }
