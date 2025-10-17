@@ -209,7 +209,6 @@ int main(int argc, char **argv) {
     /* ------------------------------- Limpieza local ------------------------------- */
     // El initializer solo crea y deja todo listo, despues se desmapea y cierra su FD.
     munmap(map, shm_size);
-    munmap(map, shm_size);
     close(fd);
     return 0;
 
