@@ -11,15 +11,8 @@
 #include <semaphore.h>
 #include "shared.h"
 
-// Estas variables se modifican desde manejadores de señal.
-// sig_atomic_t asegura que la lectura/escritura sea segura en señales.
-static volatile sig_atomic_t keep_running = 1; // 1 seguir, 0 salir
-static volatile sig_atomic_t timer_fired = 0;  // 1 salta SIGALRM
-
-// CTRL+C señal de terminar.
-void sigint_handler(int s) { (void)s; keep_running = 0; }
-// Señal del timer. No hace trabajo, solo marca para interrumpir fgets.
-void sigalrm_handler(int s) { (void)s; timer_fired = 1; }
+// Variable para el tick de alarma
+static void sigalrm_handler(int s) { (void)s; }
 
 /*
  * Procesa UNA sola ranura del buffer circular.
@@ -149,19 +142,15 @@ int main(int argc, char **argv) {
     if (!out) { perror("fopen salida"); munmap(map, file_size); close(fd); return 1; }
 
     // Configurar señales
-    // - SIGINT/SIGTERM piden salida ordenada (keep_running = 0)
     // - SIGALRM sirve para despertar fgets en modo manual y revisar terminate_flag
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sigint_handler;
-    sa.sa_flags = 0;                    // sin SA_RESTART, fgets/read pueden interrumpirse
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-
-    struct sigaction sa_alrm;
+    struct sigaction sa_ign, sa_alrm;
+    memset(&sa_ign,  0, sizeof(sa_ign));
     memset(&sa_alrm, 0, sizeof(sa_alrm));
+    sa_ign.sa_handler  = SIG_IGN;
+    sigaction(SIGINT,  &sa_ign,  NULL);
+    sigaction(SIGTERM, &sa_ign,  NULL);
     sa_alrm.sa_handler = sigalrm_handler;
-    sa_alrm.sa_flags = 0;               // sin SA_RESTART: alarm interrumpe fgets
+    sa_alrm.sa_flags   = 0;
     sigaction(SIGALRM, &sa_alrm, NULL);
 
     // Registrar nacimiento del receptor de forma atomica, con metricas y contadores
@@ -179,96 +168,71 @@ int main(int argc, char **argv) {
 
     /* ============================== MODO AUTOMATICO ============================== */
     if (strcmp(mode, "auto") == 0) {
-        // - Se bloquea en full_count cuando no hay datos
-        // - Sale si keep_running=0 o si finalize_flag pide terminar
-        while (keep_running && !hdr->terminate_flag) {
+        /* Se bloquea en full_count cuando no hay datos */
+        while (!hdr->terminate_flag) {
             if (sem_wait(&hdr->full_count) == -1) {
-                // Interrumpido por señal, volver al loop para reevaluar
-                if (errno == EINTR) continue; 
+                if (errno == EINTR) continue;      /* despertado por señal; reintentar */
                 perror("sem_wait full_count");
                 break;
             }
-            // Si el finalizador pidió terminar, devolvemos el “token” y salimos.
-            if (hdr->terminate_flag) {
+            if (hdr->terminate_flag) {             /* terminar de forma ordenada */
                 sem_post(&hdr->full_count);
                 break;
             }
-            // Procesar una ranura/slot, ya se consume el full_count
             if (process_one_slot(hdr, slot_sems, slots, out, key) == -1) {
-                // si fue EINTR intentamos seguir; si es error entonces sale
-                if (errno == EINTR) continue;
+                if (errno == EINTR) continue;      /* interrupción benigna */
                 break;
             }
         }
     }
-     /* ============================== MODO MANUAL ============================== */
+    /* ============================== MODO MANUAL ============================== */
     else if (strcmp(mode, "manual") == 0) {
-        // - Se presiona ENTER para consumir 1 carácter
-        // - alarm(1) para interrumpir periódicamente fgets con EINTR,
-        //   revisar terminate_flag y permitir salida rápida sin bloquear
         char line[512];
         printf("[RECEPTOR] Modo MANUAL. Presione ENTER para leer 1 carácter.\n");
+        const unsigned int interval = 1;   /* despertar periódico de fgets */
+        alarm(interval);                   /* primera alarma */
 
-        //Alarma para interrumpir fgets y chequear terminate_flag
-        const unsigned int interval = 1;    // Segundos para despertar fgets
-        timer_fired = 0;
-        alarm(interval);                    // Iniciar el timer
-
-        while (keep_running && !hdr->terminate_flag) {
-            // Espera la entrada del usuario, read bloqueante
-            // Si llega SIGALRM/SIGINT, fgets devuelve NULL con errno=EINTR
+        while (!hdr->terminate_flag) {
+            /* fgets bloquea; SIGALRM la interrumpe con EINTR para revisar flags */
             if (fgets(line, sizeof(line), stdin) == NULL) {
-                if (feof(stdin)) break;                               //EOF en stdin
-                if (errno == EINTR) {
-                    //Interrumpido por señal SIGALRM o SIGINT, si no hay nada que hacer sale
-                    if (!keep_running || hdr->terminate_flag) break;  
-                    // Si fue la alarma, rearmar para el próximo despertar.
-                    if (timer_fired) {
-                        timer_fired = 0;
-                        alarm(interval);
-                    }
+                if (feof(stdin)) break;                 /* EOF */
+                if (errno == EINTR) {                   /* “tick” */
+                    if (hdr->terminate_flag) break;     /* chequeo rápido */
+                    alarm(interval);                    /* rearmar y seguir esperando */
                     continue;
                 }
                 if (ferror(stdin)) { perror("fgets"); break; }
             }
-            // Si el suario presionó ENTER, consumir 1 carácter.
+
+            /* Usuario presionó ENTER -> consumir 1 carácter del buffer compartido */
             if (sem_wait(&hdr->full_count) == -1) {
-                if (errno == EINTR) {
-                    // Señal durante la espera de datos, revisar y continuar
-                    if (!keep_running || hdr->terminate_flag) break;
-                    if (timer_fired) {
-                        timer_fired = 0;
-                        alarm(interval);
-                    }
+                if (errno == EINTR) {                   /* interrupción mientras esperábamos datos */
+                    if (hdr->terminate_flag) break;
+                    alarm(interval);                    /* rearmar y reintentar */
                     continue;
                 }
                 perror("sem_wait full_count");
                 break;
             }
-            // Si en este punto se pidió terminar, devolvemos y salimos.
-            if (hdr->terminate_flag) {
+
+            if (hdr->terminate_flag) {                  /* salir ordenado */
                 sem_post(&hdr->full_count);
                 break;
             }
-            // Procesar una ranura, un caracter
+
             if (process_one_slot(hdr, slot_sems, slots, out, key) == -1) {
-                if (errno == EINTR) {
-                    if (!keep_running || hdr->terminate_flag) break;
-                    if (timer_fired) {
-                        timer_fired = 0;
-                        alarm(interval);
-                    }
+                if (errno == EINTR) {                   /* interrupción benigna */
+                    if (hdr->terminate_flag) break;
+                    alarm(interval);
                     continue;
                 }
                 break;
             }
-            // Rearmar la alarma para que, si el usuario no presiona ENTER,
-            // podamos despertar fgets y revisar flags.
+            /* Rearmar la alarma para seguir “despertando” si el usuario no pulsa ENTER */
             alarm(interval);
         }
-        alarm(0); // Cancelar la alarma al salir
+        alarm(0); /* cancelar alarma al salir */
     }
-
     else {
         fprintf(stderr, "Modo no reconocido: use 'auto' o 'manual'\n");
     }

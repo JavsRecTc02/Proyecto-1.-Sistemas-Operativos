@@ -12,15 +12,8 @@
 #include <termios.h>
 #include "shared.h"
 
-// Variables manejadoras de señal
-// sig_atomic_t para lecturas/escrituras atómicas simples
-static volatile sig_atomic_t keep_running = 1; // 1 seguir, 0 pedir salida
-static volatile sig_atomic_t timer_fired = 0;  // 1 indica que disparo la alarma
-static volatile sig_atomic_t got_sigint = 0;   // 1 se recibe SIGINT
-
-// Manejadores de señal, solo marcan flags
-void sigint_handler(int s) { (void)s; got_sigint = 1; keep_running = 0; }
-void sigalrm_handler(int s) { (void)s; timer_fired = 1; }
+// Variable para el tick de alarma
+static void sigalrm_handler(int s) { (void)s; }
 
 /* ---------------------------------------------------------------------------
  * Manejo del modo RAW del terminal para leer carácter a carácter:
@@ -169,17 +162,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Configurar señales, sin SA_RESTART para que read()/fgets() pueden interrumpirse con EINTR
-    struct sigaction sa_int;
-    struct sigaction sa_alrm;
-    memset(&sa_int, 0, sizeof(sa_int));
+    // Configurar señales, sin interrupciones con Control+C con SIGALRM para ticks
+    struct sigaction sa_ign, sa_alrm;
+    memset(&sa_ign,  0, sizeof(sa_ign));
     memset(&sa_alrm, 0, sizeof(sa_alrm));
-    sa_int.sa_handler = sigint_handler;
-    sa_int.sa_flags = 0; 
-    sa_alrm.sa_handler = sigalrm_handler;
-    sa_alrm.sa_flags = 0;
-    sigaction(SIGINT, &sa_int, NULL);
-    sigaction(SIGTERM, &sa_int, NULL);
+    sa_ign.sa_handler  = SIG_IGN;          
+    sigaction(SIGINT,  &sa_ign,  NULL);
+    sigaction(SIGTERM, &sa_ign,  NULL);
+    sa_alrm.sa_handler = sigalrm_handler;  
+    sa_alrm.sa_flags   = 0;                
     sigaction(SIGALRM, &sa_alrm, NULL);
 
     // Registrar nacimiento del Emisor, actualizar la lista de emisores lanzados
@@ -189,70 +180,61 @@ int main(int argc, char **argv) {
     sem_post(&hdr->control_sem);
     // En caso de que la key sea cero, se usa la que esta por defecto en el inicializador
     if (key_arg == 0) local_key = hdr->key;
+
     // Mensaje de Emisor creado correctamente
     printf("[EMISOR] shm=%s mode=%s key=%u file=%s\n", shm_name, mode, (unsigned int)local_key, hdr->filename);
-
     /* ============================== MODO AUTOMATICO ============================== */
     if (strcmp(mode, "auto") == 0) {
         printf("[EMISOR] Modo AUTO. Ingrese caracteres; se enviarán automáticamente cada 1 s.\n");
         set_raw_mode(1);                 // Modo RAW para leer char a char 
         const unsigned int interval = 1; // Segundos entre envios automaticos
-        timer_fired = 0;                 
         alarm(interval);                 // Primera alarma
         char line[1024];                 // Buffer local para acumular char en la consola
         size_t len = 0;                  // Registrar la cantidad de char acumulados
 
-        while (keep_running && !hdr->terminate_flag) {
+        while (!hdr->terminate_flag) {
             char c;
             // Lectura Bloqueante de un byte desde stdin en RAW
             ssize_t r = read(STDIN_FILENO, &c, 1);
-
-            // r = 1 Carácter leído entonce guardar y acumular
-            if (r == 1) {
-                // Guardar el char en archivo y acumular en buffer local
+            
+            if (r == 1) {  // llegó un carácter: guardar y acumular
                 if (fseek(f, 0, SEEK_END) == 0) {
                     fwrite(&c, 1, 1, f);
                     fflush(f);
                 }
                 if (len < sizeof(line) - 1) {
-                    line[len++] = c;            // Acumular para el envio en el proximo tick del timer
+                    line[len++] = c;    // acumular para el envío en el próximo tick
                 }
-                continue;                       // Seguir leyendo caracteres
+                continue;
             }
-            // r = 0 Fin de entrada de caracteres y salir del bucle
-            if (r == 0) break;
-            // r = -1 Interrupción por señal de alarma / timer 
+
+            if (r == 0) break; // EOF
             if (r == -1) {
                 if (errno == EINTR) {
-                    // Señal recibida, decidir si salir o continuar 
-                    if (got_sigint) break;
-                    if (hdr->terminate_flag || !keep_running) break;
-
-                    // Si la interrupción fue por la alarma, enviamos lo acumulado
-                    if (timer_fired) {
-                        timer_fired = 0;
-                        alarm(0);           // Pausar alarma mientras se envia
-                        if (len > 0) {
-                            for (size_t i = 0; i < len; ++i) {
-                                if (!keep_running || hdr->terminate_flag) break;
-                                if (send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key) == -1) {
-                                    if (got_sigint) break; // Si fue señal, pedir salida
-                                }
+                    // EINTR aquí viene del SIGALRM (SIGINT/SIGTERM están ignoradas)
+                    // => es el "tick": enviar lo acumulado y rearmar la alarma
+                    alarm(0);           // Pausar alarma mientras se envía
+                    if (len > 0) {
+                        for (size_t i = 0; i < len; ++i) {
+                            if (hdr->terminate_flag) break;
+                            if (send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key) == -1) {
+                                // En este diseño no salimos por otras señales, así que continuar
                             }
-                            len = 0;        // Limpiar el Buffer local
                         }
-                        alarm(interval);    // Reactivar la alarma
-                    }continue;              // Volver al loop
+                        len = 0;        // limpiar buffer local
+                    }
+                    alarm(interval);    // reactivar la alarma
+                    continue;           // volver al loop
                 } else {
                     perror("read stdin");
                     break;
                 }
             }
         }
-        // Al salir, si quedó algo sin enviar, enviarlo y vaciar buffer local
+        // Al salir, si quedó algo sin enviar, enviarlo
         if (len > 0) {
             for (size_t i = 0; i < len; ++i) {
-                if (!keep_running || hdr->terminate_flag) break;
+                if (hdr->terminate_flag) break;
                 send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key);
             }
         }
@@ -265,33 +247,28 @@ int main(int argc, char **argv) {
         /* ============================== MODO MANUAL ============================== */
         printf("[EMISOR] Modo MANUAL. Ingrese caracteres y presione ENTER para enviar\n");
         char line[1024];
-        const unsigned int interval = 1;  // Usar la alarma para salir rapido si finaliza
-        timer_fired = 0;                    
-        alarm(interval);                  // Primera alarma
+        const unsigned int interval = 1;   // Usar la alarma para salida rápida si finaliza
+        alarm(interval);                   // Primera alarma
 
-        while (keep_running && !hdr->terminate_flag) {
-            // gets bloquea hasta ENTER. Si llega SIGALRM o SIGINT, retorna con EINTR
+        while (!hdr->terminate_flag) {
+            // fgets bloquea hasta ENTER; si llega SIGALRM retorna con EINTR (por nuestro handler sin SA_RESTART)
             if (fgets(line, sizeof(line), stdin) == NULL) {
                 if (feof(stdin)) break;     // EOF
                 if (errno == EINTR) {
-                    // Interrupcion por señal, decidir si salir o continuar
-                    if (got_sigint) break;
-                    if (hdr->terminate_flag || !keep_running) break;
-                    // Si fue la alarma, solo rearmarla y seguir esperando
-                    if (timer_fired) {
-                        timer_fired = 0;
-                        alarm(interval);
-                    }
+                    // Fue la alarma: rearmar y seguir esperando
+                    alarm(interval);
                     continue;
                 }
                 if (ferror(stdin)) { perror("fgets"); break; }
             }
-            // Elimiar el salto de linea y calcular longitud util, linea vacia no se envia
+
+            // Eliminar el salto de linea y calcular longitud útil; línea vacía no se envía
             size_t len = strcspn(line, "\n");
             if (len == 0) {
                 alarm(interval);
                 continue;
             }
+
             // Guardar la línea en archivo de salida
             if (fseek(f, 0, SEEK_END) == 0) {
                 fwrite(line, 1, len, f);
@@ -300,18 +277,16 @@ int main(int argc, char **argv) {
             }
 
             // Enviar la línea al receptor, carácter a carácter
-            // Desactivar alarma de timer para no cortar los char
-            alarm(0);
+            alarm(0);  // Desactivar alarma mientras enviamos
             for (size_t i = 0; i < len; ++i) {
-                if (!keep_running || hdr->terminate_flag) break;
+                if (hdr->terminate_flag) break;
                 if (send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key) == -1) {
-                    if (got_sigint) break; // si fue interrumpido por señal, salir del bucle
+                    // No salimos por señales; continuar o romper si lo prefieres
                 }
             }
-            // Reactivar alarma para permitir salida rápida si se pide terminar
-            timer_fired = 0;
-            alarm(interval);
+            alarm(interval);  // Reactivar alarma
         }
+
         alarm(0); // Cancelar alarma al salir
     }
 
