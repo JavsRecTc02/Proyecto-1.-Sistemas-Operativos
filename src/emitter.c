@@ -123,6 +123,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Semaforo para verificar que hay byte listo para enviar
+    // static sem_t pending_sem;
+    // if (sem_init(&pending_sem, 0, 0) == -1) { perror("sem_init pending_sem"); return 1; }
+
     /* ---------------------------------------------------------------
     *  PARÁMETROS DE ENTRADA DEL PROGRAMA
     *  argv[1]: nombre del segmento de memoria compartida
@@ -163,14 +167,9 @@ int main(int argc, char **argv) {
     }
 
     // Configurar señales, sin interrupciones con Control+C con SIGALRM para ticks
-    struct sigaction sa_ign, sa_alrm;
-    memset(&sa_ign,  0, sizeof(sa_ign));
-    memset(&sa_alrm, 0, sizeof(sa_alrm));
-    sa_ign.sa_handler  = SIG_IGN;          
-    sigaction(SIGINT,  &sa_ign,  NULL);
-    sigaction(SIGTERM, &sa_ign,  NULL);
-    sa_alrm.sa_handler = sigalrm_handler;  
-    sa_alrm.sa_flags   = 0;                
+    struct sigaction sa_alrm = {0};
+    sa_alrm.sa_handler = sigalrm_handler;
+    sa_alrm.sa_flags   = 0;
     sigaction(SIGALRM, &sa_alrm, NULL);
 
     // Registrar nacimiento del Emisor, actualizar la lista de emisores lanzados
@@ -183,54 +182,55 @@ int main(int argc, char **argv) {
 
     // Mensaje de Emisor creado correctamente
     printf("[EMISOR] shm=%s mode=%s key=%u file=%s\n", shm_name, mode, (unsigned int)local_key, hdr->filename);
-    /* ============================== MODO AUTOMATICO ============================== */
-    if (strcmp(mode, "auto") == 0) {
-        printf("[EMISOR] Modo AUTO. Ingrese caracteres; se enviarán automáticamente cada 1 s.\n");
-        set_raw_mode(1);                 // Modo RAW para leer char a char 
-        const unsigned int interval = 1; // Segundos entre envios automaticos
-        alarm(interval);                 // Primera alarma
-        char line[1024];                 // Buffer local para acumular char en la consola
-        size_t len = 0;                  // Registrar la cantidad de char acumulados
 
-        while (!hdr->terminate_flag) {
+    /* ============================== MODO AUTOMÁTICO ============================== */
+    if (strcmp(mode, "auto") == 0) {
+        printf("[EMISOR] Modo AUTO.\n");
+        set_raw_mode(1);                   // Modo RAW para leer char a char
+        const unsigned int interval = 1;   // Segundos entre cada tick
+        alarm(interval);                   // Primera alarma
+        char   line[1024];                 // Buff local para acumular char en consola
+        size_t len = 0;                    // Registro de char acumulados
+        size_t pos = 0;
+
+        while (1) {
+            if (hdr->terminate_flag) break;
+
             char c;
-            // Lectura Bloqueante de un byte desde stdin en RAW
+            // Lectura bloqueante de un byte desde stdin en RAW
             ssize_t r = read(STDIN_FILENO, &c, 1);
-            
-            if (r == 1) {  // llegó un carácter: guardar y acumular
-                if (fseek(f, 0, SEEK_END) == 0) {
-                    fwrite(&c, 1, 1, f);
-                    fflush(f);
+
+            // r = 1 Caracter leido entonces guardar y acumular
+            if (r == 1) {
+                // Almacenar en el archivo
+                if (fseek(f, 0, SEEK_END) == 0) { fwrite(&c,1,1,f); fflush(f); }
+                if (len < sizeof(line)) line[len++] = c;
+
+                // Envio del byte
+                alarm(0);         // Quitar la alarma mientras se envian bytes
+                if (pos < len) {
+                    (void)send_byte(hdr, slot_sems, slots, (uint8_t)line[pos], local_key);
+                    pos++;
+                    if (pos == len) { pos = 0; len = 0; }
                 }
-                if (len < sizeof(line) - 1) {
-                    line[len++] = c;    // acumular para el envío en el próximo tick
-                }
+                // Restaurar la alarma
+                alarm(interval);
                 continue;
             }
-
-            if (r == 0) break; // EOF
+            // r = 0 Fin de entrada de caracteres y salir del bucle
+            if (r == 0) break;
+            // r = -1 Interrupción por señal de alarma / timer 
             if (r == -1) {
                 if (errno == EINTR) {
-                    // EINTR aquí viene del SIGALRM (SIGINT/SIGTERM están ignoradas)
-                    // => es el "tick": enviar lo acumulado y rearmar la alarma
-                    alarm(0);           // Pausar alarma mientras se envía
-                    if (len > 0) {
-                        for (size_t i = 0; i < len; ++i) {
-                            if (hdr->terminate_flag) break;
-                            if (send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key) == -1) {
-                                // En este diseño no salimos por otras señales, así que continuar
-                            }
-                        }
-                        len = 0;        // limpiar buffer local
-                    }
-                    alarm(interval);    // reactivar la alarma
-                    continue;           // volver al loop
-                } else {
-                    perror("read stdin");
-                    break;
+                    if (hdr->terminate_flag) break;   // Salida
+                    alarm(interval);                  // Rearmar alarma
+                    continue;
                 }
+                perror("read stdin");
+                break;
             }
         }
+
         // Al salir, si quedó algo sin enviar, enviarlo
         if (len > 0) {
             for (size_t i = 0; i < len; ++i) {
@@ -242,51 +242,40 @@ int main(int argc, char **argv) {
         alarm(0);           // Cancelar alarma
     }
 
+    /* ============================== MODO MANUAL ============================== */
     else {
-
-        /* ============================== MODO MANUAL ============================== */
-        printf("[EMISOR] Modo MANUAL. Ingrese caracteres y presione ENTER para enviar\n");
-        char line[1024];
-        const unsigned int interval = 1;   // Usar la alarma para salida rápida si finaliza
+        printf("[EMISOR] Modo MANUAL. Escriba y presione ENTER para enviar.\n");
+        const unsigned int interval = 1;   // Usar la alarma para salir rapido si finaliza
         alarm(interval);                   // Primera alarma
 
-        while (!hdr->terminate_flag) {
-            // fgets bloquea hasta ENTER; si llega SIGALRM retorna con EINTR (por nuestro handler sin SA_RESTART)
+        while (1) {
+            if (hdr->terminate_flag) break;
+            char line[1024];
+            // gets bloquea hasta ENTER. Si llega SIGALRM o SIGINT, retorna con EINTR
             if (fgets(line, sizeof(line), stdin) == NULL) {
-                if (feof(stdin)) break;     // EOF
+                if (feof(stdin)) break;
                 if (errno == EINTR) {
-                    // Fue la alarma: rearmar y seguir esperando
-                    alarm(interval);
+                    if (hdr->terminate_flag) break;   // Salida
+                    alarm(interval);                  // Rearmar alarma
                     continue;
                 }
-                if (ferror(stdin)) { perror("fgets"); break; }
+                perror("fgets");
+                break;
             }
-
-            // Eliminar el salto de linea y calcular longitud útil; línea vacía no se envía
-            size_t len = strcspn(line, "\n");
-            if (len == 0) {
-                alarm(interval);
-                continue;
-            }
-
+            // Elimiar el salto de linea y calcular longitud util, linea vacia no se envia
+            size_t n = strcspn(line, "\n");
+            if (n == 0) { alarm(interval); continue; }
             // Guardar la línea en archivo de salida
-            if (fseek(f, 0, SEEK_END) == 0) {
-                fwrite(line, 1, len, f);
-                fwrite("\n", 1, 1, f);
-                fflush(f);
-            }
-
-            // Enviar la línea al receptor, carácter a carácter
-            alarm(0);  // Desactivar alarma mientras enviamos
-            for (size_t i = 0; i < len; ++i) {
+            if (fseek(f, 0, SEEK_END) == 0) { fwrite(line,1,n,f); fwrite("\n",1,1,f); fflush(f); }
+            // Enviar byte al buff, carácter a carácter
+            // Desactivar alarma de timer para no cortar los char
+            alarm(0);
+            for (size_t i = 0; i < n; ++i) {
                 if (hdr->terminate_flag) break;
-                if (send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key) == -1) {
-                    // No salimos por señales; continuar o romper si lo prefieres
-                }
+                (void)send_byte(hdr, slot_sems, slots, (uint8_t)line[i], local_key);
             }
-            alarm(interval);  // Reactivar alarma
+            alarm(interval); // Reactivar la alarma
         }
-
         alarm(0); // Cancelar alarma al salir
     }
 

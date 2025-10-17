@@ -168,75 +168,78 @@ int main(int argc, char **argv) {
 
     /* ============================== MODO AUTOMATICO ============================== */
     if (strcmp(mode, "auto") == 0) {
-        /* Se bloquea en full_count cuando no hay datos */
-        while (!hdr->terminate_flag) {
+        // - Se bloquea en full_count cuando no hay datos
+        while (1) {
             if (sem_wait(&hdr->full_count) == -1) {
-                if (errno == EINTR) continue;      /* despertado por señal; reintentar */
+                if (errno == EINTR) continue;      // Despertado por señal, reevaluar
                 perror("sem_wait full_count");
                 break;
             }
-            if (hdr->terminate_flag) {             /* terminar de forma ordenada */
+            if (hdr->terminate_flag) {             // Si el finalizador pidió terminar, devolvemos y salimos.
                 sem_post(&hdr->full_count);
                 break;
             }
+            // Procesar una ranura/slot, ya se consume el full_count
             if (process_one_slot(hdr, slot_sems, slots, out, key) == -1) {
-                if (errno == EINTR) continue;      /* interrupción benigna */
+                if (errno == EINTR) continue;      // Manejar interrupcion por EINTR
                 break;
             }
         }
     }
     /* ============================== MODO MANUAL ============================== */
     else if (strcmp(mode, "manual") == 0) {
+        // - Se presiona ENTER para consumir 1 byte
         char line[512];
         printf("[RECEPTOR] Modo MANUAL. Presione ENTER para leer 1 carácter.\n");
-        const unsigned int interval = 1;   /* despertar periódico de fgets */
-        alarm(interval);                   /* primera alarma */
+        const unsigned int interval = 1;   // Segundos para despertar fgets
+        alarm(interval);                   // Primera alarma
 
-        while (!hdr->terminate_flag) {
-            /* fgets bloquea; SIGALRM la interrumpe con EINTR para revisar flags */
+        while (1) {
+            // Espera la entrada del usuario, read bloqueante
+            // Si llega SIGALRM/SIGINT, fgets devuelve NULL con errno=EINTR
             if (fgets(line, sizeof(line), stdin) == NULL) {
-                if (feof(stdin)) break;                 /* EOF */
-                if (errno == EINTR) {                   /* “tick” */
-                    if (hdr->terminate_flag) break;     /* chequeo rápido */
-                    alarm(interval);                    /* rearmar y seguir esperando */
+                if (feof(stdin)) break;                 // EOF
+                if (errno == EINTR) {                   // En caso de alarma
+                    if (hdr->terminate_flag) break;     // Revisar condicion de finalizador
+                    alarm(interval);                    // Rearmar alarma y continuar
                     continue;
                 }
                 if (ferror(stdin)) { perror("fgets"); break; }
             }
-
-            /* Usuario presionó ENTER -> consumir 1 carácter del buffer compartido */
+            // Si el suario presionó ENTER, consumir 1 carácter.
             if (sem_wait(&hdr->full_count) == -1) {
-                if (errno == EINTR) {                   /* interrupción mientras esperábamos datos */
+                // Señal durante la espera de datos, revisar y continuar
+                if (errno == EINTR) {                   
                     if (hdr->terminate_flag) break;
-                    alarm(interval);                    /* rearmar y reintentar */
+                    alarm(interval);                    
                     continue;
                 }
                 perror("sem_wait full_count");
                 break;
             }
-
-            if (hdr->terminate_flag) {                  /* salir ordenado */
+            // Si en este punto se pidió terminar, devolvemos y salimos
+            if (hdr->terminate_flag) {                  
                 sem_post(&hdr->full_count);
                 break;
             }
-
+            // Procesar una ranura, un caracter o byte
             if (process_one_slot(hdr, slot_sems, slots, out, key) == -1) {
-                if (errno == EINTR) {                   /* interrupción benigna */
+                if (errno == EINTR) {                   // Revisar condicion del finalizador
                     if (hdr->terminate_flag) break;
                     alarm(interval);
                     continue;
                 }
                 break;
             }
-            /* Rearmar la alarma para seguir “despertando” si el usuario no pulsa ENTER */
+            // Rearmar la alarma para que, si el usuario no presiona ENTER,
+            // Revisar condicion del finalizador.
             alarm(interval);
         }
-        alarm(0); /* cancelar alarma al salir */
+        alarm(0); // Cancelar alarma al salir
     }
     else {
         fprintf(stderr, "Modo no reconocido: use 'auto' o 'manual'\n");
     }
-
     // Al salir decrementar receptores activos y notificar finalizer si somos últimos
     if (sem_wait(&hdr->control_sem) == -1) {
         if (errno != EINTR) perror("sem_wait control_sem");

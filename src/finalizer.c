@@ -14,8 +14,7 @@
 #include "shared.h"
 
 /* Configuración de espera para el cierre ordenado */
-#define MAX_WAIT_SECONDS 15          // tiempo total máximo antes de forzar salida 
-#define WAIT_INTERVAL     5          // intervalo entre sem_timedwait() (segundos) 
+#define MAX_WAIT_SECONDS 15          // Tiempo de espera para forzar salida
 
 /* --- Manejo de señal asíncrona para permitir SIGTERM --- */
 // Flag para salir de esperas bloqueantes de teclado
@@ -66,7 +65,7 @@ static int wait_for_space_or_signal(void)
 
     // Mensaje del Finalizador en consola
     fprintf(stderr,
-        "\n\x1b[1;36m[Finalizador]\x1b[0m Presiona \x1b[1mESPACIO\x1b[0m (o 'Q') para finalizar.\n");
+        "\n\x1b[1;36m[Finalizador]\x1b[0m Presiona \x1b[1mESPACIO\x1b[1m o 'Q' para finalizar.\n");
 
     unsigned char ch = 0;
     ssize_t n = read(fd, &ch, 1);   // read bloquea el kernel duerme el proceso
@@ -187,7 +186,12 @@ int main(int argc, char **argv)
     }
 
     // Si ya no hay procesos activos, imprimimos estadísticas y salimos
-    sem_wait(&hdr->control_sem);
+    if (sem_wait(&hdr->control_sem) == -1) {
+        perror("sem_wait control_sem");
+        munmap(map, file_size);
+        close(fd);
+        return 1;
+    }
     int active_emitters  = hdr->active_emitters;
     int active_receivers = hdr->active_receivers;
     sem_post(&hdr->control_sem);
@@ -196,53 +200,47 @@ int main(int argc, char **argv)
         print_stats_and_scan(hdr);
         munmap(map, file_size);
         close(fd);
-        /* shm_unlink(shm_name); */
+        // shm_unlink(shm_name); 
         return 0;
     }
 
-    /* Esperar a que terminen emisores/receptores:
-          - Ultimo proceso haga sem_post(hdr->finalizer_sem)
-          - Verificar contadores bajo control_sem con timeouts */
+    // Esperar a que terminen emisores/receptores
+    // Ultimo proceso haga sem_post(hdr->finalizer_sem)
+    // Verificar contadores bajo control_sem con timeout total 
+
     struct timespec now;
-    time_t waited = 0;
+    clock_gettime(CLOCK_REALTIME, &now);
+    struct timespec final_ts = now;
+    final_ts.tv_sec += MAX_WAIT_SECONDS;
+
     int final_ok = 0;
-
-    while (waited < MAX_WAIT_SECONDS) {
-        clock_gettime(CLOCK_REALTIME, &now);
-        struct timespec ts;
-        ts.tv_sec  = now.tv_sec + WAIT_INTERVAL;
-        ts.tv_nsec = now.tv_nsec;
-
-        int rc = sem_timedwait(&hdr->finalizer_sem, &ts);
-        if (rc == 0) {
-            // sem_post realizado por el último proceso en salir
-            final_ok = 1;
-            break;
-        } else {
-            if (errno == ETIMEDOUT) {
-                // Verificamos si ya no quedan procesos activos
-                if (sem_wait(&hdr->control_sem) == -1) {
-                    if (errno == EINTR) continue;
-                    perror("sem_wait control_sem");
-                    break;
-                }
-                active_emitters  = hdr->active_emitters;
-                active_receivers = hdr->active_receivers;
-                sem_post(&hdr->control_sem);
-
-                if (active_emitters == 0 && active_receivers == 0) {
-                    final_ok = 1;
-                    break;
-                }
-                waited += WAIT_INTERVAL; // Acumular el tiempo de espera
-                continue;
-            } else if (errno == EINTR) {
-                /* interrumpido por señal; volvemos a intentar dentro del bucle */
-                continue;
+    int rc = sem_timedwait(&hdr->finalizer_sem, &final_ts);
+    if (rc == 0) {
+        // Despertado por el último proceso en salir
+        final_ok = 1;
+    } else {
+        if (errno == ETIMEDOUT) {
+            fprintf(stderr,
+                "\n[Finalizador] Tiempo de espera excedido (%d s).\n",
+                MAX_WAIT_SECONDS);
+        } else if (errno == EINTR) {
+            // Manejar en caso de que sea haga un cierre con Control+C
+            if (sem_wait(&hdr->control_sem) == -1) {
+                perror("sem_wait control_sem");
             } else {
-                perror("sem_timedwait finalizer_sem");
-                break;
+                int ae = hdr->active_emitters;
+                int ar = hdr->active_receivers;
+                sem_post(&hdr->control_sem);
+                if (ae == 0 && ar == 0) {
+                    final_ok = 1;
+                } else {
+                    fprintf(stderr,
+                        "\n[Finalizador] sem_timedwait interrumpido por señal; "
+                        "continuando con cierre.\n");
+                }
             }
+        } else {
+            perror("sem_timedwait finalizer_sem");
         }
     }
 
@@ -250,12 +248,11 @@ int main(int argc, char **argv)
     if (!final_ok) {
         fprintf(stderr,
             "\n[Finalizador] Aviso: tiempo de espera excedido (%d s). "
-            "Continuando con cierre.\n", MAX_WAIT_SECONDS);
+            "Continuando con cierre forzado.\n", MAX_WAIT_SECONDS);
     }
 
     // Estadísticas finales y limpieza de recursos
     print_stats_and_scan(hdr);
-
     munmap(map, file_size);
     close(fd);
 
